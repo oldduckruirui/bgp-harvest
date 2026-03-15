@@ -1,0 +1,14 @@
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+__pycache__/
+*.pyc
+.bgp_tmp/
+.bgp_tmp.back/
+log.txt
+dist/
+build/
+*.egg-info/
+docker/clickhouse/data/
+docker/clickhouse/logs/

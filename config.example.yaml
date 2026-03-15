@@ -1,0 +1,35 @@
+# Harvest window and parsing behaviour.
+harvest:
+  collector:
+  temporary_dir: ./.bgp_tmp
+  batch_size: 100000
+  ip_version: "6"
+  max_download_workers: 20
+  max_parse_workers: 20
+  discovery_page_size: 500
+  project: routeviews
+
+# Route Origin Validation service settings.
+rov:
+  enabled: true
+  endpoint: http://127.0.0.1:8323/validity
+  timeout_seconds: 30
+  max_workers: 20
+  request_batch_size: 64
+
+# ClickHouse storage backend settings.
+clickhouse:
+  host: 127.0.0.1
+  port: 9000
+  database: bgp
+  user: bgp_user
+  password: "bgp_password"
+  use_http_driver: false
+  async_inserts: true
+
+# Runtime behaviour for timeouts, logging, and scheduling.
+runtime:
+  timeout_seconds: 3600
+  log_level: INFO
+  schedule_interval_hours: 2
+  schedule_minute: 30
