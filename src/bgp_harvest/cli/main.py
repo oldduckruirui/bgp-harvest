@@ -17,6 +17,7 @@ from ..pipeline import (
     PyBGPStreamRibParser,
     RouteAnnotator,
     Scheduler,
+    SnapshotROVValidator,
     cleanup_temporary_directory,
     default_window,
 )
@@ -102,12 +103,20 @@ def _build_service(settings: Settings) -> HarvestJob:
     parser = PyBGPStreamRibParser(ip_version=settings.harvest.ip_version)
     validator = None
     if settings.rov.enabled:
-        validator = HTTPROVValidator(
-            endpoint=settings.rov.endpoint,
-            timeout_seconds=settings.rov.timeout_seconds,
-            max_workers=settings.rov.max_workers,
-            request_batch_size=settings.rov.request_batch_size,
-        )
+        if settings.rov.mode == "snapshot":
+            validator = SnapshotROVValidator(
+                endpoint=settings.rov.snapshot_endpoint,
+                timeout_seconds=settings.rov.timeout_seconds,
+            )
+        elif settings.rov.mode == "http":
+            validator = HTTPROVValidator(
+                endpoint=settings.rov.endpoint,
+                timeout_seconds=settings.rov.timeout_seconds,
+                max_workers=settings.rov.max_workers,
+                request_batch_size=settings.rov.request_batch_size,
+            )
+        else:
+            raise ValueError(f"Unsupported ROV mode: {settings.rov.mode}")
     repository = ClickHouseRouteRepository(settings.clickhouse, batch_size=settings.harvest.batch_size)
 
     return HarvestJob(

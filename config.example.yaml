@@ -12,7 +12,9 @@ harvest:
 # Route Origin Validation service settings.
 rov:
   enabled: true
+  mode: snapshot
   endpoint: http://127.0.0.1:8323/validity
+  snapshot_endpoint: http://127.0.0.1:8323/json
   timeout_seconds: 30
   max_workers: 20
   request_batch_size: 64

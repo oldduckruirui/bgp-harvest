@@ -62,7 +62,9 @@ class ROVSettings:
     """Settings for the Route Origin Validation client."""
 
     enabled: bool
+    mode: str
     endpoint: str
+    snapshot_endpoint: str
     timeout_seconds: int
     max_workers: int
     request_batch_size: int
@@ -113,7 +115,9 @@ DEFAULTS: dict[str, Any] = {
     },
     "rov": {
         "enabled": True,
+        "mode": "snapshot",
         "endpoint": "http://127.0.0.1:8323/validity",
+        "snapshot_endpoint": "http://127.0.0.1:8323/json",
         "timeout_seconds": 30,
         "max_workers": 10,
         "request_batch_size": 64,
@@ -148,7 +152,9 @@ ENV_MAP: dict[str, tuple[str, str, Any]] = {
     "BGP_HARVEST_START": ("harvest", "start", str),
     "BGP_HARVEST_END": ("harvest", "end", str),
     "BGP_HARVEST_ROV_ENABLED": ("rov", "enabled", _parse_bool),
+    "BGP_HARVEST_ROV_MODE": ("rov", "mode", str),
     "BGP_HARVEST_ROV_ENDPOINT": ("rov", "endpoint", str),
+    "BGP_HARVEST_ROV_SNAPSHOT_ENDPOINT": ("rov", "snapshot_endpoint", str),
     "BGP_HARVEST_ROV_TIMEOUT_SECONDS": ("rov", "timeout_seconds", int),
     "BGP_HARVEST_ROV_MAX_WORKERS": ("rov", "max_workers", int),
     "BGP_HARVEST_ROV_REQUEST_BATCH_SIZE": ("rov", "request_batch_size", int),
@@ -210,7 +216,9 @@ def _build_dataclasses(payload: dict[str, Any]) -> Settings:
         ),
         rov=ROVSettings(
             enabled=bool(rov_data["enabled"]),
+            mode=str(rov_data["mode"]).lower(),
             endpoint=str(rov_data["endpoint"]),
+            snapshot_endpoint=str(rov_data["snapshot_endpoint"]),
             timeout_seconds=int(rov_data["timeout_seconds"]),
             max_workers=int(rov_data["max_workers"]),
             request_batch_size=int(rov_data["request_batch_size"]),

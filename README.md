@@ -1,12 +1,12 @@
 # bgp-harvest
 
-`bgp-harvest` is a BGP RIB ingestion pipeline. It discovers RIB snapshots, downloads and parses them, validates `(prefix, origin)` pairs through an ROV endpoint, and stores the resulting route data in ClickHouse.
+`bgp-harvest` is a BGP RIB ingestion pipeline. It discovers RIB snapshots, downloads and parses them, validates `(prefix, origin)` pairs through Routinator-backed ROV, and stores the resulting route data in ClickHouse.
 
 ## Features
 
 - Discover RIB resources from the BGPKit Broker API for an explicit UTC time window
 - Download and parse RIB files with `pybgpstream`
-- Validate unique `(prefix, origin)` pairs through Routinator-compatible HTTP endpoints
+- Validate unique `(prefix, origin)` pairs through either a local Routinator VRP snapshot or Routinator HTTP endpoints
 - Persist routes and AS paths into ClickHouse
 - Run once or on a recurring schedule
 
@@ -48,12 +48,12 @@ At minimum, make sure the following services or dependencies are available:
 - Python 3.11 or newer
 - `pybgpstream` and its native dependencies
 - a reachable ClickHouse instance
-- a reachable ROV HTTP endpoint, such as Routinator
+- a reachable Routinator instance for ROV, preferably exposing `http://127.0.0.1:8323/json`
 
 Adjust [config.example.yaml](./config.example.yaml) for your environment, or override defaults with environment variables. At minimum, validate:
 
 - ClickHouse connection settings
-- ROV API endpoint
+- ROV mode and endpoint settings
 - temporary download directory permissions
 - scheduling timeout and default window settings
 
@@ -119,9 +119,12 @@ The configuration is split into four sections:
 
 - `harvest`: collector, temporary directory, batch size, IP version, discovery paging, and concurrency settings
   - `batch_size`: internal batch size used when writing to ClickHouse
-- `rov`: validation enablement, endpoint, timeout, and concurrency settings
-  - `max_workers`: number of concurrent ROV HTTP request batches
-  - `request_batch_size`: number of `(prefix, origin)` pairs included in each POST `/validity` request
+- `rov`: validation enablement, mode, endpoint, timeout, and concurrency settings
+  - `mode`: `snapshot` uses a single Routinator `/json` VRP dump per harvest run; `http` uses the existing `/validity` API
+  - `snapshot_endpoint`: Routinator VRP JSON endpoint, used in `snapshot` mode
+  - `endpoint`: Routinator `/validity` endpoint, used in `http` mode
+  - `max_workers`: number of concurrent ROV HTTP request batches in `http` mode
+  - `request_batch_size`: number of `(prefix, origin)` pairs included in each POST `/validity` request in `http` mode
 - `clickhouse`: storage connection settings, driver selection, and async insert toggle
 - `runtime`: log level, per-run timeout, schedule interval, and schedule minute
 
@@ -129,7 +132,8 @@ All environment variables use the `BGP_HARVEST_` prefix, for example:
 
 ```bash
 export BGP_HARVEST_CLICKHOUSE_HOST=127.0.0.1
-export BGP_HARVEST_ROV_ENDPOINT=http://127.0.0.1:8323/validity
+export BGP_HARVEST_ROV_MODE=snapshot
+export BGP_HARVEST_ROV_SNAPSHOT_ENDPOINT=http://127.0.0.1:8323/json
 ```
 
 ## Docker

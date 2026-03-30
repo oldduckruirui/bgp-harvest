@@ -4,9 +4,10 @@ import datetime as dt
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from typing import Any
 
 from bgp_harvest.models import RouteRecord, ValidationState
-from bgp_harvest.pipeline import HTTPROVValidator, RouteAnnotator
+from bgp_harvest.pipeline import HTTPROVValidator, RouteAnnotator, SnapshotROVValidator
 
 
 class FakeValidator:
@@ -113,3 +114,73 @@ def test_http_rov_validator_splits_pairs_into_post_batches() -> None:
         (("2001:db8:2::/48", 64498), ("2001:db8:3::/48", 64499)),
         (("2001:db8:4::/48", 64500),),
     }
+
+
+class SnapshotValidatorProbe(SnapshotROVValidator):
+    def __init__(self, payload: dict[str, Any] | Exception) -> None:
+        self.payload = payload
+        self.fetch_calls = 0
+        super().__init__(
+            endpoint="http://127.0.0.1:8323/json",
+            timeout_seconds=1,
+        )
+
+    def _fetch_snapshot_payload(self) -> dict[str, Any]:
+        self.fetch_calls += 1
+        if isinstance(self.payload, Exception):
+            raise self.payload
+        return self.payload
+
+
+def test_snapshot_rov_validator_classifies_states_locally() -> None:
+    validator = SnapshotValidatorProbe(
+        {
+            "metadata": {"generatedTime": "2026-03-27T06:00:12Z"},
+            "roas": [
+                {"asn": "AS64496", "prefix": "2001:db8::/32", "maxLength": 48, "ta": "test"},
+                {"asn": "AS64510", "prefix": "192.0.2.0/24", "maxLength": 24, "ta": "test"},
+            ],
+        }
+    )
+
+    results = validator.bulk_validate(
+        [
+            ("2001:db8:1::/48", 64496),
+            ("2001:db8:1::/49", 64496),
+            ("2001:db8:1::/48", 64500),
+            ("2001:db9::/32", 64496),
+            ("192.0.2.0/24", 64510),
+        ]
+    )
+
+    assert results[("2001:db8:1::/48", 64496)] == ValidationState.VALID
+    assert results[("2001:db8:1::/49", 64496)] == ValidationState.INVALID
+    assert results[("2001:db8:1::/48", 64500)] == ValidationState.INVALID
+    assert results[("2001:db9::/32", 64496)] == ValidationState.NOT_FOUND
+    assert results[("192.0.2.0/24", 64510)] == ValidationState.VALID
+
+
+def test_snapshot_rov_validator_loads_snapshot_once() -> None:
+    validator = SnapshotValidatorProbe(
+        {
+            "metadata": {"generatedTime": "2026-03-27T06:00:12Z"},
+            "roas": [
+                {"asn": "AS64496", "prefix": "2001:db8::/32", "maxLength": 48, "ta": "test"},
+            ],
+        }
+    )
+
+    first = validator.bulk_validate([("2001:db8:1::/48", 64496)])
+    second = validator.bulk_validate([("2001:db8:2::/48", 64496)])
+
+    assert first[("2001:db8:1::/48", 64496)] == ValidationState.VALID
+    assert second[("2001:db8:2::/48", 64496)] == ValidationState.VALID
+    assert validator.fetch_calls == 1
+
+
+def test_snapshot_rov_validator_returns_unknown_when_snapshot_load_fails() -> None:
+    validator = SnapshotValidatorProbe(RuntimeError("boom"))
+
+    results = validator.bulk_validate([("2001:db8::/32", 64496)])
+
+    assert results == {("2001:db8::/32", 64496): ValidationState.UNKNOWN}

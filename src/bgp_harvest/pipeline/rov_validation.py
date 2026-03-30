@@ -1,21 +1,183 @@
-"""Route Origin Validation helpers and the default HTTP validator client."""
+"""Route Origin Validation helpers and validator clients."""
 
 from __future__ import annotations
 
+import ipaddress as ip
 import logging
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Iterable, TypeVar
+from dataclasses import dataclass
+from typing import Any, Iterable, TypeVar
 
 import requests
 from requests.adapters import HTTPAdapter
 
-from ..models.types import RouteRecord, ValidationState, normalize_validation_state
 from ..models.interfaces import RouteValidator
+from ..models.types import RouteRecord, ValidationState, normalize_validation_state
 
 LOG = logging.getLogger(__name__)
 T = TypeVar("T")
+IPNetwork = ip.IPv4Network | ip.IPv6Network
+
+
+@dataclass(frozen=True, slots=True)
+class _VRPEntry:
+    """One validated ROA payload entry used for local snapshot checks."""
+
+    asn: int
+    max_length: int
+
+
+class SnapshotROVValidator:
+    """Load a Routinator VRP snapshot once and validate pairs locally."""
+
+    def __init__(
+        self,
+        endpoint: str,
+        timeout_seconds: int = 60,
+    ) -> None:
+        self.endpoint = endpoint.rstrip("/")
+        self.timeout_seconds = timeout_seconds
+        self.max_workers = 1
+        self._session = self._build_session()
+        self._snapshot_generated_at: str | None = None
+        self._snapshot_available = False
+        self._ipv4_vrps: dict[IPNetwork, list[_VRPEntry]] = {}
+        self._ipv6_vrps: dict[IPNetwork, list[_VRPEntry]] = {}
+        self._load_snapshot()
+
+    def bulk_validate(
+        self,
+        pairs: Iterable[tuple[str, int]],
+    ) -> dict[tuple[str, int], ValidationState]:
+        """Validate pairs against the in-memory snapshot."""
+
+        pair_list = list(pairs)
+        if not pair_list:
+            return {}
+        if not self._snapshot_available:
+            return {pair: ValidationState.UNKNOWN for pair in pair_list}
+        return {pair: self._validate_pair(*pair) for pair in pair_list}
+
+    def _validate_pair(self, prefix: str, origin: int) -> ValidationState:
+        """Validate one pair using covering VRPs from the local snapshot."""
+
+        try:
+            network = ip.ip_network(prefix, strict=False)
+        except ValueError:
+            LOG.warning("Skipping malformed route prefix during snapshot validation prefix=%s", prefix)
+            return ValidationState.UNKNOWN
+        return self._validate_network(network, int(origin))
+
+    def _validate_network(self, network: IPNetwork, origin: int) -> ValidationState:
+        """Classify one prefix/origin pair using RFC-style ROV semantics."""
+
+        vrp_index = self._ipv4_vrps if network.version == 4 else self._ipv6_vrps
+        saw_covering_vrp = False
+
+        for prefix_length in range(network.prefixlen, -1, -1):
+            covering = network if prefix_length == network.prefixlen else network.supernet(new_prefix=prefix_length)
+            for vrp in vrp_index.get(covering, []):
+                saw_covering_vrp = True
+                if vrp.asn == origin and network.prefixlen <= vrp.max_length:
+                    return ValidationState.VALID
+
+        if saw_covering_vrp:
+            return ValidationState.INVALID
+        return ValidationState.NOT_FOUND
+
+    def _load_snapshot(self) -> None:
+        """Fetch and index the current VRP snapshot."""
+
+        try:
+            payload = self._fetch_snapshot_payload()
+            ipv4_vrps, ipv6_vrps, generated_at = self._parse_snapshot(payload)
+        except Exception:
+            self._snapshot_available = False
+            self._snapshot_generated_at = None
+            self._ipv4_vrps = {}
+            self._ipv6_vrps = {}
+            LOG.warning(
+                "Failed to load VRP snapshot endpoint=%s; validation results will be unknown",
+                self.endpoint,
+                exc_info=True,
+            )
+            return
+
+        self._snapshot_available = True
+        self._snapshot_generated_at = generated_at
+        self._ipv4_vrps = ipv4_vrps
+        self._ipv6_vrps = ipv6_vrps
+        LOG.info(
+            "Loaded VRP snapshot endpoint=%s generated_at=%s ipv4_prefixes=%s ipv6_prefixes=%s",
+            self.endpoint,
+            generated_at,
+            len(ipv4_vrps),
+            len(ipv6_vrps),
+        )
+
+    def _fetch_snapshot_payload(self) -> dict[str, Any]:
+        """Fetch the current VRP snapshot payload from Routinator."""
+
+        response = self._session.get(
+            self.endpoint,
+            headers={"accept": "application/json"},
+            timeout=self.timeout_seconds,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise ValueError("Unexpected snapshot payload")
+        return payload
+
+    @staticmethod
+    def _parse_snapshot(
+        payload: dict[str, Any],
+    ) -> tuple[dict[IPNetwork, list[_VRPEntry]], dict[IPNetwork, list[_VRPEntry]], str | None]:
+        """Build per-family prefix indexes from the Routinator JSON dump."""
+
+        raw_roas = payload.get("roas")
+        if not isinstance(raw_roas, list):
+            raise ValueError("Unexpected snapshot payload")
+
+        ipv4_vrps: dict[IPNetwork, list[_VRPEntry]] = {}
+        ipv6_vrps: dict[IPNetwork, list[_VRPEntry]] = {}
+        for entry in raw_roas:
+            if not isinstance(entry, dict):
+                raise ValueError("Unexpected VRP entry")
+
+            raw_asn = str(entry.get("asn", ""))
+            prefix = str(entry.get("prefix", ""))
+            if not raw_asn.startswith("AS"):
+                raise ValueError("Unexpected ASN in snapshot payload")
+
+            network = ip.ip_network(prefix, strict=False)
+            vrp = _VRPEntry(
+                asn=int(raw_asn[2:]),
+                max_length=int(entry["maxLength"]),
+            )
+            target = ipv4_vrps if network.version == 4 else ipv6_vrps
+            target.setdefault(network, []).append(vrp)
+
+        metadata = payload.get("metadata")
+        generated_at = None
+        if isinstance(metadata, dict):
+            raw_generated_at = metadata.get("generatedTime")
+            generated_at = str(raw_generated_at) if raw_generated_at is not None else None
+
+        return ipv4_vrps, ipv6_vrps, generated_at
+
+    @staticmethod
+    def _build_session() -> requests.Session:
+        """Build a small dedicated session for the one-time snapshot fetch."""
+
+        session = requests.Session()
+        session.trust_env = False
+        adapter = HTTPAdapter(max_retries=3, pool_connections=1, pool_maxsize=1)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        return session
 
 
 class HTTPROVValidator:
