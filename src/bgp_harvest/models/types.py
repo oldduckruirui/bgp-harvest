@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import ipaddress as ip
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -117,3 +118,41 @@ class RouteRecord:
             collector=collector,
             timestamp=timestamp,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class VrpObject:
+    """One unique VRP object normalized from a Routinator snapshot entry."""
+
+    vrp_id: int
+    prefix: str
+    prefix_length: int
+    max_length: int
+    asn: int
+    ta: str
+    ip_version: int
+
+    def __post_init__(self) -> None:
+        network = ip.ip_network(self.prefix, strict=False)
+        object.__setattr__(self, "prefix", str(network))
+        object.__setattr__(self, "prefix_length", int(network.prefixlen))
+        object.__setattr__(self, "max_length", int(self.max_length))
+        object.__setattr__(self, "asn", int(self.asn))
+        object.__setattr__(self, "ta", str(self.ta))
+        object.__setattr__(self, "ip_version", int(network.version))
+
+
+@dataclass(frozen=True, slots=True)
+class VrpSnapshot:
+    """One deduplicated VRP snapshot plus its referenced VRP objects."""
+
+    snapshot_id: int
+    source_endpoint: str
+    generated_at: dt.datetime | None
+    objects: tuple[VrpObject, ...]
+
+    def __post_init__(self) -> None:
+        if self.generated_at is not None:
+            object.__setattr__(self, "generated_at", ensure_utc(self.generated_at))
+        object.__setattr__(self, "source_endpoint", str(self.source_endpoint))
+        object.__setattr__(self, "objects", tuple(self.objects))

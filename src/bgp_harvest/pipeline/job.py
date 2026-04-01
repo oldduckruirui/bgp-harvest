@@ -93,12 +93,19 @@ class HarvestJob:
             LOG.info("Download stage completed; starting parse/validate/store pipeline files=%s", len(materialized))
 
             summary = self._process_downloaded_resources(materialized)
+            vrp_snapshot = self.validation_service.current_vrp_snapshot()
             if summary.min_timestamp and summary.max_timestamp:
-                self.repository.update_route_metadata(summary.min_timestamp, summary.max_timestamp)
-                LOG.info(
-                    "Recorded harvest metadata start=%s end=%s",
+                self.repository.update_route_metadata(
                     summary.min_timestamp,
                     summary.max_timestamp,
+                    vrp_snapshot_id=vrp_snapshot.snapshot_id if vrp_snapshot is not None else None,
+                    vrp_generated_at=vrp_snapshot.generated_at if vrp_snapshot is not None else None,
+                )
+                LOG.info(
+                    "Recorded harvest metadata start=%s end=%s vrp_snapshot_id=%s",
+                    summary.min_timestamp,
+                    summary.max_timestamp,
+                    vrp_snapshot.snapshot_id if vrp_snapshot is not None else None,
                 )
 
             LOG.info(
@@ -178,6 +185,15 @@ class HarvestJob:
             len(validated_routes),
             time.perf_counter() - validation_started_at,
         )
+
+        vrp_snapshot = self.validation_service.current_vrp_snapshot()
+        if vrp_snapshot is not None:
+            self.repository.store_vrp_snapshot(vrp_snapshot)
+            LOG.info(
+                "Persisted VRP snapshot snapshot_id=%s objects=%s",
+                vrp_snapshot.snapshot_id,
+                len(vrp_snapshot.objects),
+            )
 
         storage_started_at = time.perf_counter()
         self.repository.ingest_routes(validated_routes)

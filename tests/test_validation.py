@@ -6,7 +6,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
-from bgp_harvest.models import RouteRecord, ValidationState
+from bgp_harvest.models import RouteRecord, ValidationState, VrpSnapshot
 from bgp_harvest.pipeline import HTTPROVValidator, RouteAnnotator, SnapshotROVValidator
 
 
@@ -176,6 +176,41 @@ def test_snapshot_rov_validator_loads_snapshot_once() -> None:
     assert first[("2001:db8:1::/48", 64496)] == ValidationState.VALID
     assert second[("2001:db8:2::/48", 64496)] == ValidationState.VALID
     assert validator.fetch_calls == 1
+
+
+def test_snapshot_rov_validator_exposes_deduplicated_snapshot_objects() -> None:
+    validator = SnapshotValidatorProbe(
+        {
+            "metadata": {"generatedTime": "2026-03-27T06:00:12Z"},
+            "roas": [
+                {"asn": "AS64496", "prefix": "2001:db8::/32", "maxLength": 48, "ta": "test"},
+                {"asn": "AS64496", "prefix": "2001:db8:0::/32", "maxLength": 48, "ta": "test"},
+            ],
+        }
+    )
+
+    snapshot = validator.current_snapshot()
+
+    assert isinstance(snapshot, VrpSnapshot)
+    assert snapshot.generated_at == dt.datetime(2026, 3, 27, 6, 0, 12, tzinfo=dt.timezone.utc)
+    assert len(snapshot.objects) == 1
+    assert snapshot.objects[0].prefix == "2001:db8::/32"
+    assert snapshot.objects[0].asn == 64496
+
+
+def test_snapshot_rov_validator_reloads_snapshot_on_reset() -> None:
+    validator = SnapshotValidatorProbe(
+        {
+            "metadata": {"generatedTime": "2026-03-27T06:00:12Z"},
+            "roas": [
+                {"asn": "AS64496", "prefix": "2001:db8::/32", "maxLength": 48, "ta": "test"},
+            ],
+        }
+    )
+
+    validator.reset()
+
+    assert validator.fetch_calls == 2
 
 
 def test_snapshot_rov_validator_returns_unknown_when_snapshot_load_fails() -> None:

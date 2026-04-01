@@ -5,7 +5,7 @@ from __future__ import annotations
 import datetime as dt
 from typing import Iterable, Mapping, Protocol, Sequence
 
-from .types import MaterializedRibResource, RibResource, RouteRecord, ValidationState
+from .types import MaterializedRibResource, RibResource, RouteRecord, ValidationState, VrpSnapshot
 
 
 class RibDiscovery(Protocol):
@@ -46,4 +46,12 @@ class RouteRepository(Protocol):
 
     def ingest_routes(self, routes: Iterable[RouteRecord]) -> None: ...
 
-    def update_route_metadata(self, start_time: dt.datetime, end_time: dt.datetime) -> None: ...
+    def store_vrp_snapshot(self, snapshot: VrpSnapshot) -> None: ...
+
+    def update_route_metadata(
+        self,
+        start_time: dt.datetime,
+        end_time: dt.datetime,
+        vrp_snapshot_id: int | None = None,
+        vrp_generated_at: dt.datetime | None = None,
+    ) -> None: ...

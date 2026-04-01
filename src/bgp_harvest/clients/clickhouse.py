@@ -10,7 +10,7 @@ from typing import Any
 from typing import Iterable, Sequence
 
 from ..config.settings import ClickHouseSettings
-from ..models.types import RouteRecord
+from ..models.types import RouteRecord, VrpObject, VrpSnapshot
 from ..pipeline.path_id import compute_path_id
 from ..pipeline.runtime import batch_iterable
 
@@ -29,6 +29,8 @@ except ImportError:  # pragma: no cover
 
 class ClickHouseRouteRepository:
     """Persist harvested routes into ClickHouse using bulk inserts."""
+
+    _LOOKUP_BATCH_SIZE = 2_000
 
     def __init__(self, settings: ClickHouseSettings, batch_size: int) -> None:
         self.settings = settings
@@ -127,16 +129,61 @@ class ClickHouseRouteRepository:
             time.perf_counter() - ingest_started_at,
         )
 
-    def update_route_metadata(self, start_time: dt.datetime, end_time: dt.datetime) -> None:
+    def store_vrp_snapshot(self, snapshot: VrpSnapshot) -> None:
+        """Persist a deduplicated VRP snapshot and its object references."""
+
+        if self._snapshot_exists(snapshot.snapshot_id):
+            LOG.info("Skipping existing VRP snapshot snapshot_id=%s", snapshot.snapshot_id)
+            return
+
+        objects_by_id = {item.vrp_id: item for item in snapshot.objects}
+        object_rows = list(objects_by_id.values())
+        new_object_rows = self._filter_new_vrp_objects(object_rows)
+        snapshot_started_at = time.perf_counter()
+        if new_object_rows:
+            self._insert_vrp_objects(new_object_rows)
+        self._insert_vrp_snapshot(
+            snapshot_id=snapshot.snapshot_id,
+            generated_at=snapshot.generated_at,
+            source_endpoint=snapshot.source_endpoint,
+            object_count=len(object_rows),
+        )
+        if object_rows:
+            self._insert_vrp_snapshot_entries(snapshot.snapshot_id, list(objects_by_id))
+        LOG.info(
+            "Stored VRP snapshot snapshot_id=%s objects=%s new_objects=%s elapsed_seconds=%.3f",
+            snapshot.snapshot_id,
+            len(object_rows),
+            len(new_object_rows),
+            time.perf_counter() - snapshot_started_at,
+        )
+
+    def update_route_metadata(
+        self,
+        start_time: dt.datetime,
+        end_time: dt.datetime,
+        vrp_snapshot_id: int | None = None,
+        vrp_generated_at: dt.datetime | None = None,
+    ) -> None:
         """Record the time range covered by a successful harvest run."""
 
-        payload = [(self._normalize_ts(start_time), self._normalize_ts(end_time))]
+        payload = [
+            (
+                self._normalize_ts(start_time),
+                self._normalize_ts(end_time),
+                vrp_snapshot_id,
+                self._normalize_optional_ts(vrp_generated_at),
+            )
+        ]
         if hasattr(self.client, "execute"):
             kwargs: dict[str, Any] = {"types_check": False}
             if self._insert_settings:
                 kwargs["settings"] = self._insert_settings
             self.client.execute(
-                "INSERT INTO route_metadata (start_time, end_time) VALUES",
+                (
+                    "INSERT INTO route_metadata "
+                    "(start_time, end_time, vrp_snapshot_id, vrp_generated_at) VALUES"
+                ),
                 payload,
                 **kwargs,
             )
@@ -145,7 +192,7 @@ class ClickHouseRouteRepository:
         self.client.insert(
             "route_metadata",
             payload,
-            column_names=["start_time", "end_time"],
+            column_names=["start_time", "end_time", "vrp_snapshot_id", "vrp_generated_at"],
             settings=self._insert_settings,
         )
 
@@ -238,6 +285,107 @@ class ClickHouseRouteRepository:
                 )
         self._seen_paths.update(path_id for path_id, _ in rows)
 
+    def _insert_vrp_objects(self, objects: Sequence[VrpObject]) -> None:
+        """Insert or upsert unique VRP object rows."""
+
+        row_payload = [
+            (
+                int(item.vrp_id),
+                item.prefix,
+                int(item.prefix_length),
+                int(item.max_length),
+                int(item.asn),
+                item.ta,
+                int(item.ip_version),
+            )
+            for item in objects
+        ]
+        if hasattr(self.client, "execute"):
+            kwargs: dict[str, Any] = {"types_check": False}
+            if self._insert_settings:
+                kwargs["settings"] = self._insert_settings
+            self.client.execute(
+                (
+                    "INSERT INTO vrp_objects "
+                    "(vrp_id, prefix, prefix_length, max_length, asn, ta, ip_version) VALUES"
+                ),
+                row_payload,
+                **kwargs,
+            )
+            return
+
+        self.client.insert(
+            "vrp_objects",
+            row_payload,
+            column_names=["vrp_id", "prefix", "prefix_length", "max_length", "asn", "ta", "ip_version"],
+            settings=self._insert_settings,
+        )
+
+    def _insert_vrp_snapshot(
+        self,
+        snapshot_id: int,
+        generated_at: dt.datetime | None,
+        source_endpoint: str,
+        object_count: int,
+    ) -> None:
+        """Insert one VRP snapshot metadata row."""
+
+        row_payload = [
+            (
+                int(snapshot_id),
+                self._normalize_optional_ts(generated_at),
+                source_endpoint,
+                int(object_count),
+            )
+        ]
+        if hasattr(self.client, "execute"):
+            kwargs: dict[str, Any] = {"types_check": False}
+            if self._insert_settings:
+                kwargs["settings"] = self._insert_settings
+            self.client.execute(
+                "INSERT INTO vrp_snapshots (snapshot_id, generated_at, source_endpoint, object_count) VALUES",
+                row_payload,
+                **kwargs,
+            )
+            return
+
+        self.client.insert(
+            "vrp_snapshots",
+            row_payload,
+            column_names=["snapshot_id", "generated_at", "source_endpoint", "object_count"],
+            settings=self._insert_settings,
+        )
+
+    def _insert_vrp_snapshot_entries(self, snapshot_id: int, vrp_ids: Sequence[int]) -> None:
+        """Insert snapshot-to-object reference rows."""
+
+        row_payload = [(int(snapshot_id), int(vrp_id)) for vrp_id in vrp_ids]
+        if hasattr(self.client, "execute"):
+            kwargs: dict[str, Any] = {"types_check": False}
+            if self._insert_settings:
+                kwargs["settings"] = self._insert_settings
+            self.client.execute(
+                "INSERT INTO vrp_snapshot_entries (snapshot_id, vrp_id) VALUES",
+                row_payload,
+                **kwargs,
+            )
+            return
+
+        self.client.insert(
+            "vrp_snapshot_entries",
+            row_payload,
+            column_names=["snapshot_id", "vrp_id"],
+            settings=self._insert_settings,
+        )
+
+    def _filter_new_vrp_objects(self, objects: Sequence[VrpObject]) -> list[VrpObject]:
+        """Return only VRP objects that are not already present in ClickHouse."""
+
+        if not objects:
+            return []
+        existing_ids = self._fetch_existing_vrp_object_ids([item.vrp_id for item in objects])
+        return [item for item in objects if item.vrp_id not in existing_ids]
+
     def _insert_routes(
         self,
         prefixes: Sequence[str],
@@ -300,6 +448,28 @@ class ClickHouseRouteRepository:
         """Fetch all known path identifiers from ClickHouse."""
 
         query = "SELECT path_id FROM as_paths"
+        return self._query_first_column(query)
+
+    def _fetch_existing_vrp_object_ids(self, vrp_ids: Sequence[int]) -> set[int]:
+        """Fetch the subset of VRP object ids that already exist."""
+
+        existing_ids: set[int] = set()
+        lookup_batch_size = min(self.batch_size, self._LOOKUP_BATCH_SIZE)
+        for batch in batch_iterable(vrp_ids, lookup_batch_size):
+            id_list = ", ".join(str(int(vrp_id)) for vrp_id in batch)
+            query = f"SELECT vrp_id FROM vrp_objects WHERE vrp_id IN ({id_list})"
+            existing_ids.update(self._query_first_column(query))
+        return existing_ids
+
+    def _snapshot_exists(self, snapshot_id: int) -> bool:
+        """Return whether one snapshot id is already present."""
+
+        query = f"SELECT snapshot_id FROM vrp_snapshots WHERE snapshot_id = {int(snapshot_id)} LIMIT 1"
+        return bool(self._query_first_column(query))
+
+    def _query_first_column(self, query: str) -> set[int]:
+        """Execute a query and return the first column as integers."""
+
         if hasattr(self.client, "execute"):
             return {int(row[0]) for row in self.client.execute(query)}
         if hasattr(self.client, "query_column"):
@@ -314,3 +484,11 @@ class ClickHouseRouteRepository:
         if value.tzinfo is None:
             return value.replace(tzinfo=dt.timezone.utc)
         return value.astimezone(dt.timezone.utc)
+
+    @classmethod
+    def _normalize_optional_ts(cls, value: dt.datetime | None) -> dt.datetime | None:
+        """Normalize nullable timestamps before inserting them into ClickHouse."""
+
+        if value is None:
+            return None
+        return cls._normalize_ts(value)

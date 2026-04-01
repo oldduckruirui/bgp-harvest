@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import datetime as dt
+import hashlib
 import ipaddress as ip
 import logging
 import threading
@@ -14,7 +16,7 @@ import requests
 from requests.adapters import HTTPAdapter
 
 from ..models.interfaces import RouteValidator
-from ..models.types import RouteRecord, ValidationState, normalize_validation_state
+from ..models.types import RouteRecord, ValidationState, VrpObject, VrpSnapshot, normalize_validation_state
 
 LOG = logging.getLogger(__name__)
 T = TypeVar("T")
@@ -29,8 +31,55 @@ class _VRPEntry:
     max_length: int
 
 
+def _hash_u64(parts: Iterable[str]) -> int:
+    """Return a stable unsigned 64-bit identifier for a list of string parts."""
+
+    digest = hashlib.blake2b(digest_size=8)
+    for part in parts:
+        digest.update(part.encode("utf-8"))
+        digest.update(b"\0")
+    return int.from_bytes(digest.digest(), "big", signed=False)
+
+
+def _parse_snapshot_generated_at(metadata: dict[str, Any] | None) -> dt.datetime | None:
+    """Parse the Routinator snapshot generation timestamp when present."""
+
+    if not isinstance(metadata, dict):
+        return None
+
+    raw_generated_at = metadata.get("generatedTime")
+    if raw_generated_at is not None:
+        try:
+            return dt.datetime.fromisoformat(str(raw_generated_at).replace("Z", "+00:00")).astimezone(
+                dt.timezone.utc
+            )
+        except ValueError:
+            LOG.debug("Failed to parse snapshot generatedTime=%s", raw_generated_at, exc_info=True)
+
+    raw_generated_epoch = metadata.get("generated")
+    if raw_generated_epoch is None:
+        return None
+    try:
+        return dt.datetime.fromtimestamp(float(raw_generated_epoch), tz=dt.timezone.utc)
+    except (TypeError, ValueError):
+        LOG.debug("Failed to parse snapshot generated=%s", raw_generated_epoch, exc_info=True)
+        return None
+
+
+def _build_snapshot_id(generated_at: dt.datetime | None, objects: Iterable[VrpObject]) -> int:
+    """Build a stable snapshot identifier from generation time and object ids."""
+
+    digest = hashlib.blake2b(digest_size=8)
+    generated_marker = generated_at.isoformat(timespec="milliseconds") if generated_at is not None else ""
+    digest.update(generated_marker.encode("utf-8"))
+    digest.update(b"\0")
+    for item in sorted(objects, key=lambda value: value.vrp_id):
+        digest.update(int(item.vrp_id).to_bytes(8, "big", signed=False))
+    return int.from_bytes(digest.digest(), "big", signed=False)
+
+
 class SnapshotROVValidator:
-    """Load a Routinator VRP snapshot once and validate pairs locally."""
+    """Load a Routinator VRP snapshot and validate pairs locally."""
 
     def __init__(
         self,
@@ -41,11 +90,21 @@ class SnapshotROVValidator:
         self.timeout_seconds = timeout_seconds
         self.max_workers = 1
         self._session = self._build_session()
-        self._snapshot_generated_at: str | None = None
+        self._snapshot: VrpSnapshot | None = None
         self._snapshot_available = False
         self._ipv4_vrps: dict[IPNetwork, list[_VRPEntry]] = {}
         self._ipv6_vrps: dict[IPNetwork, list[_VRPEntry]] = {}
+        self.reset()
+
+    def reset(self) -> None:
+        """Reload the snapshot so each harvest run uses a fresh VRP dump."""
+
         self._load_snapshot()
+
+    def current_snapshot(self) -> VrpSnapshot | None:
+        """Return the currently loaded VRP snapshot when available."""
+
+        return self._snapshot
 
     def bulk_validate(
         self,
@@ -92,10 +151,10 @@ class SnapshotROVValidator:
 
         try:
             payload = self._fetch_snapshot_payload()
-            ipv4_vrps, ipv6_vrps, generated_at = self._parse_snapshot(payload)
+            ipv4_vrps, ipv6_vrps, snapshot = self._parse_snapshot(payload)
         except Exception:
             self._snapshot_available = False
-            self._snapshot_generated_at = None
+            self._snapshot = None
             self._ipv4_vrps = {}
             self._ipv6_vrps = {}
             LOG.warning(
@@ -106,15 +165,16 @@ class SnapshotROVValidator:
             return
 
         self._snapshot_available = True
-        self._snapshot_generated_at = generated_at
+        self._snapshot = snapshot
         self._ipv4_vrps = ipv4_vrps
         self._ipv6_vrps = ipv6_vrps
         LOG.info(
-            "Loaded VRP snapshot endpoint=%s generated_at=%s ipv4_prefixes=%s ipv6_prefixes=%s",
+            "Loaded VRP snapshot endpoint=%s generated_at=%s ipv4_prefixes=%s ipv6_prefixes=%s objects=%s",
             self.endpoint,
-            generated_at,
+            snapshot.generated_at,
             len(ipv4_vrps),
             len(ipv6_vrps),
+            len(snapshot.objects),
         )
 
     def _fetch_snapshot_payload(self) -> dict[str, Any]:
@@ -131,10 +191,10 @@ class SnapshotROVValidator:
             raise ValueError("Unexpected snapshot payload")
         return payload
 
-    @staticmethod
     def _parse_snapshot(
+        self,
         payload: dict[str, Any],
-    ) -> tuple[dict[IPNetwork, list[_VRPEntry]], dict[IPNetwork, list[_VRPEntry]], str | None]:
+    ) -> tuple[dict[IPNetwork, list[_VRPEntry]], dict[IPNetwork, list[_VRPEntry]], VrpSnapshot]:
         """Build per-family prefix indexes from the Routinator JSON dump."""
 
         raw_roas = payload.get("roas")
@@ -143,6 +203,7 @@ class SnapshotROVValidator:
 
         ipv4_vrps: dict[IPNetwork, list[_VRPEntry]] = {}
         ipv6_vrps: dict[IPNetwork, list[_VRPEntry]] = {}
+        objects_by_id: dict[int, VrpObject] = {}
         for entry in raw_roas:
             if not isinstance(entry, dict):
                 raise ValueError("Unexpected VRP entry")
@@ -153,20 +214,38 @@ class SnapshotROVValidator:
                 raise ValueError("Unexpected ASN in snapshot payload")
 
             network = ip.ip_network(prefix, strict=False)
+            ta = str(entry.get("ta", ""))
+            asn = int(raw_asn[2:])
+            max_length = int(entry["maxLength"])
+            vrp_id = _hash_u64((str(network), str(asn), str(max_length), ta))
             vrp = _VRPEntry(
-                asn=int(raw_asn[2:]),
-                max_length=int(entry["maxLength"]),
+                asn=asn,
+                max_length=max_length,
             )
             target = ipv4_vrps if network.version == 4 else ipv6_vrps
             target.setdefault(network, []).append(vrp)
+            objects_by_id.setdefault(
+                vrp_id,
+                VrpObject(
+                    vrp_id=vrp_id,
+                    prefix=str(network),
+                    prefix_length=network.prefixlen,
+                    max_length=max_length,
+                    asn=asn,
+                    ta=ta,
+                    ip_version=network.version,
+                ),
+            )
 
-        metadata = payload.get("metadata")
-        generated_at = None
-        if isinstance(metadata, dict):
-            raw_generated_at = metadata.get("generatedTime")
-            generated_at = str(raw_generated_at) if raw_generated_at is not None else None
-
-        return ipv4_vrps, ipv6_vrps, generated_at
+        generated_at = _parse_snapshot_generated_at(payload.get("metadata"))
+        objects = tuple(sorted(objects_by_id.values(), key=lambda item: item.vrp_id))
+        snapshot = VrpSnapshot(
+            snapshot_id=_build_snapshot_id(generated_at, objects),
+            source_endpoint=self.endpoint,
+            generated_at=generated_at,
+            objects=objects,
+        )
+        return ipv4_vrps, ipv6_vrps, snapshot
 
     @staticmethod
     def _build_session() -> requests.Session:
@@ -347,9 +426,24 @@ class RouteAnnotator:
     def reset(self) -> None:
         """Drop cached validation results before a new harvest run starts."""
 
+        validator_reset = getattr(self.validator, "reset", None)
+        if callable(validator_reset):
+            validator_reset()
         with self._condition:
             self._validation_cache.clear()
             self._inflight_pairs.clear()
+
+    def current_vrp_snapshot(self) -> VrpSnapshot | None:
+        """Return the currently loaded VRP snapshot from the backing validator."""
+
+        if self.validator is None:
+            return None
+        snapshot_getter = getattr(self.validator, "current_snapshot", None)
+        if callable(snapshot_getter):
+            snapshot = snapshot_getter()
+            if isinstance(snapshot, VrpSnapshot):
+                return snapshot
+        return None
 
     def cached_state(self, pair: tuple[str, int]) -> ValidationState | None:
         """Return a cached validation state for one pair when available."""
